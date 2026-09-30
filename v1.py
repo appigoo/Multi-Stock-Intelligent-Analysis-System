@@ -386,8 +386,7 @@ def load_quick_data(ticker: str):
 
 
 # ─── 新聞抓取（加強 fallback）───
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_news(ticker: str, company_name: str):
+def _fetch_news_raw(ticker: str, company_name: str):
     news_items = []
     queries = [
         f"{ticker} stock",
@@ -424,6 +423,9 @@ def fetch_news(ticker: str, company_name: str):
             seen.add(key)
             unique.append(n)
     return unique[:12]
+
+
+fetch_news = st.cache_data(ttl=600, show_spinner=False)(_fetch_news_raw)
 
 
 # ─── 技術指標計算（修正版）───
@@ -967,9 +969,305 @@ def update_actual(record_id, actual_price):
 
 
 # ─────────────────────────────────────────────
+# 🧠 AI 深度總結（基本面 + 財報 + 新聞 + 技術面 → 優先順序）
+# ─────────────────────────────────────────────
+FUND_KEYS = [
+    "sector", "industry", "marketCap", "trailingPE", "forwardPE", "pegRatio",
+    "priceToSalesTrailing12Months", "revenueGrowth", "earningsGrowth",
+    "earningsQuarterlyGrowth", "grossMargins", "operatingMargins", "profitMargins",
+    "debtToEquity", "freeCashflow", "recommendationKey", "targetMeanPrice",
+    "numberOfAnalystOpinions", "shortPercentOfFloat", "beta",
+]
+
+
+def _fmt_pct(v, signed=True):
+    if isinstance(v, (int, float)) and np.isfinite(v):
+        return f"{v*100:+.1f}%" if signed else f"{v*100:.1f}%"
+    return "N/A"
+
+
+def _fmt_num(v, nd=1):
+    if isinstance(v, (int, float)) and np.isfinite(v):
+        return f"{v:.{nd}f}"
+    return "N/A"
+
+
+def _fmt_money(v):
+    if not isinstance(v, (int, float)) or not np.isfinite(v):
+        return "N/A"
+    a = abs(v)
+    if a >= 1e12: return f"${v/1e12:.2f}T"
+    if a >= 1e9:  return f"${v/1e9:.1f}B"
+    if a >= 1e6:  return f"${v/1e6:.1f}M"
+    return f"${v:,.0f}"
+
+
+def _gather_context(ticker: str, name: str):
+    """抓單一股票的基本面 / 財報日 / 近期 EPS 驚喜 / 新聞標題。
+    不呼叫任何 st.* 函數，可安全用於執行緒。"""
+    ctx = {"fund": {}, "news": [], "earn_date": None, "earn_days": None, "eps_hist": []}
+    tk = None
+    try:
+        tk = yf.Ticker(ticker)
+        info = tk.info or {}
+        for k in FUND_KEYS:
+            v = info.get(k)
+            if v is not None:
+                ctx["fund"][k] = v
+    except Exception:
+        pass
+
+    if tk is not None:
+        # 下次財報日
+        try:
+            cal = tk.calendar
+            dates = cal.get("Earnings Date") if isinstance(cal, dict) else None
+            if dates:
+                if not isinstance(dates, (list, tuple)):
+                    dates = [dates]
+                today = datetime.now().date()
+                future = [pd.Timestamp(x).date() for x in dates if pd.Timestamp(x).date() >= today]
+                if future:
+                    d0 = min(future)
+                    ctx["earn_date"] = d0.isoformat()
+                    ctx["earn_days"] = (d0 - today).days
+        except Exception:
+            pass
+        # 近 4 季 EPS 實際 vs 預期
+        try:
+            ed = tk.get_earnings_dates(limit=8)
+            if ed is not None and not ed.empty and "Reported EPS" in ed.columns:
+                rep = ed.dropna(subset=["Reported EPS"]).head(4)
+                for idx, row in rep.iterrows():
+                    ctx["eps_hist"].append({
+                        "date": pd.Timestamp(idx).strftime("%Y-%m-%d"),
+                        "est":  safe_float(row.get("EPS Estimate"), float("nan")),
+                        "act":  safe_float(row.get("Reported EPS"), float("nan")),
+                        "sur":  safe_float(row.get("Surprise(%)"), float("nan")),
+                    })
+        except Exception:
+            pass
+
+    try:
+        ctx["news"] = _fetch_news_raw(ticker, name)[:6]
+    except Exception:
+        pass
+    return ctx
+
+
+def compute_rr_profile(d):
+    """機械式風險報酬估算（以現價入場）：
+    止損 = 1.5×ATR；目標 = 近20日高/低點，若距離不足 0.5×ATR 則用 2×ATR 突破延伸。"""
+    df, curr = d["df"], d["curr"]
+    atr = d["atr"] if d["atr"] > 0 else curr * 0.02
+    hi20 = safe_float(df["High"].tail(20).max())
+    lo20 = safe_float(df["Low"].tail(20).min())
+
+    l_stop = curr - 1.5 * atr
+    if hi20 - curr >= 0.5 * atr:
+        l_tgt, l_basis = hi20, "20日高"
+    else:
+        l_tgt, l_basis = curr + 2 * atr, "突破延伸2ATR"
+    s_stop = curr + 1.5 * atr
+    if curr - lo20 >= 0.5 * atr:
+        s_tgt, s_basis = lo20, "20日低"
+    else:
+        s_tgt, s_basis = curr - 2 * atr, "跌破延伸2ATR"
+
+    l_rr = (l_tgt - curr) / max(curr - l_stop, 0.01)
+    s_rr = (curr - s_tgt) / max(s_stop - curr, 0.01)
+    close = df["Close"]
+    ret20 = (curr / safe_float(close.iloc[-21]) - 1) * 100 if len(close) > 21 and safe_float(close.iloc[-21]) else 0.0
+    return {
+        "atr": atr, "atr_pct": atr / curr * 100 if curr else 0,
+        "long":  {"stop": l_stop, "tgt": l_tgt, "rr": l_rr, "basis": l_basis},
+        "short": {"stop": s_stop, "tgt": s_tgt, "rr": s_rr, "basis": s_basis},
+        "ret20": ret20,
+        "dist_high": (curr / d["week52h"] - 1) * 100 if d["week52h"] else 0,
+    }
+
+
+def build_context_text(valid, ctx_map, single_cache, period_key):
+    """把所有分析結果整理成給 LLM 的精簡文字。"""
+    bias_zh = {"bullish": "偏多", "bearish": "偏空", "neutral": "中性"}
+    blocks = []
+    for t, d in valid:
+        rr = compute_rr_profile(d)
+        c = ctx_map.get(t, {}) or {}
+        f = c.get("fund", {}) or {}
+        lines = [
+            f"[{t}] {d['name'][:28]} | 板塊:{f.get('sector', 'N/A')} | 現價 ${d['curr']:.2f} ({d['pct']:+.2f}%) | 技術分 {d['score']}/5 {bias_zh.get(d['bias'], '')}",
+            f"技術: RSI {d['rsi']:.1f}, MACD {d['macd_cross']}, "
+            f"價>SMA20:{'是' if d['curr'] > d['sma20'] else '否'}, 價>SMA50:{'是' if d['curr'] > d['sma50'] else '否'}, "
+            f"量比 {d['vol_ratio']:.1f}x, ATR ${rr['atr']:.2f}({rr['atr_pct']:.1f}%), "
+            f"20日報酬 {rr['ret20']:+.1f}%, 距52W高 {rr['dist_high']:+.1f}%",
+            f"機械RR(現價入場): 做多 止損${rr['long']['stop']:.2f} 目標${rr['long']['tgt']:.2f}({rr['long']['basis']}) RR 1:{rr['long']['rr']:.1f}"
+            f" | 做空 止損${rr['short']['stop']:.2f} 目標${rr['short']['tgt']:.2f}({rr['short']['basis']}) RR 1:{rr['short']['rr']:.1f}",
+            f"基本面: 市值 {_fmt_money(f.get('marketCap'))}, 本益比 {_fmt_num(f.get('trailingPE'))}, 預估PE {_fmt_num(f.get('forwardPE'))}, "
+            f"PEG {_fmt_num(f.get('pegRatio'), 2)}, 營收成長 {_fmt_pct(f.get('revenueGrowth'))}, 獲利成長 {_fmt_pct(f.get('earningsGrowth'))}, "
+            f"營業利益率 {_fmt_pct(f.get('operatingMargins'), False)}, 淨利率 {_fmt_pct(f.get('profitMargins'), False)}, "
+            f"負債/權益 {_fmt_num(f.get('debtToEquity'))}, 自由現金流 {_fmt_money(f.get('freeCashflow'))}, "
+            f"分析師 {f.get('recommendationKey', 'N/A')}(目標均價 {('$' + _fmt_num(f.get('targetMeanPrice'), 2)) if f.get('targetMeanPrice') else 'N/A'}, "
+            f"{f.get('numberOfAnalystOpinions', 'N/A')}人), 空單比例 {_fmt_pct(f.get('shortPercentOfFloat'), False)}",
+        ]
+        # 財報
+        earn = "下次財報: 資料不足"
+        if c.get("earn_date"):
+            earn = f"下次財報: {c['earn_date']} (距今 {c['earn_days']} 天)"
+        eps = c.get("eps_hist") or []
+        if eps:
+            eps_txt = "; ".join(
+                f"{e['date']} 實際{_fmt_num(e['act'], 2)}/預期{_fmt_num(e['est'], 2)}/驚喜{_fmt_num(e['sur'])}%"
+                for e in eps
+            )
+            earn += f" | 近{len(eps)}季EPS: {eps_txt}"
+        else:
+            earn += " | 近季EPS: 資料不足"
+        lines.append(earn)
+        # 新聞
+        news = c.get("news") or []
+        if news:
+            lines.append("新聞標題: " + " / ".join(f"{i+1}){n['title'][:90]}({n['date'][5:16]})" for i, n in enumerate(news[:5])))
+        else:
+            lines.append("新聞標題: 資料不足")
+        # 單股 AI 分析結果（如先前做過深入分析）
+        sc = single_cache.get(t)
+        if sc:
+            lines.append(
+                f"單股AI深入分析({sc['period']}): 偏向 {sc['bias']} 強度{sc['strength']}/10; 摘要: {str(sc['summary'])[:160]}; "
+                f"新聞情緒 {sc['news_sentiment']}"
+            )
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+PORTFOLIO_SYSTEM_PROMPT = """你是一位資深美股交易分析師，任務是把一批股票的「技術面、基本面、財報、新聞、風險報酬」整合成可直接決策的總結。
+
+【鐵律】
+1. 只能使用輸入資料中的數字與事實。輸入標示「資料不足」或 N/A 的項目，必須明說資料不足，嚴禁編造財報數字、日期、新聞內容或分析師評級。
+2. 新聞只有標題，不得臆測標題以外的內文；只能就標題的方向（利多／利空／中性）與事件類型判斷。
+3. 風險報酬比一律採用輸入提供的「機械RR」，並在比較時註明前提（以現價入場、止損 1.5×ATR）。
+4. 結論必須果斷：給出明確的先後順序與操作方向，不要用「可能」「或許」含糊帶過；但不確定的地方要坦白標出。
+5. 所有價位請寫具體美元數字（取自輸入的止損／目標，或由輸入數據直接推得）。
+6. 財報日 ≤ 7 天的標的，必須標示「財報事件風險」，並說明是否建議避開隔夜持倉。
+7. 使用繁體中文，以 Markdown 表格為主、文字精簡。
+
+【輸出格式（依序，標題照抄）】
+## 一、基本面／財報／新聞 vs 技術面 逐檔檢查
+表格欄位：代號 ｜ 技術面訊號 ｜ 基本面與財報重點 ｜ 新聞方向 ｜ 吻合／衝突 ｜ 一句話說明
+（每一檔都要列，判定只能是「吻合」「衝突」或「部分吻合」）
+
+## 二、同向訊號的風險報酬比較
+先列出技術面同向（偏多或偏空）的標的群組，再用表格比較：代號 ｜ 方向 ｜ 入場 ｜ 止損 ｜ 目標 ｜ RR ｜ 額外風險（財報、估值、空單比例等）。
+最後一句明確指出「哪一支風險報酬最佳」及原因（須同時考慮 RR 與事件風險，不可只看 RR 數字）。
+
+## 三、技術面與基本面的背離
+- **技術強、基本面有風險**：列出標的、具體風險點（用數字）、建議如何處理。
+- **技術弱、基本面佳**：列出標的、可能的反轉條件與觀察價位。
+若無符合者，寫「無」並說明原因。
+
+## 四、操作優先順序（若只能選 1–2 支）
+表格：順位 ｜ 代號 ｜ 方向 ｜ 入場 ｜ 止損 ｜ 目標 ｜ RR ｜ 建議倉位（標準倉的幾倍）｜ 核心理由
+之後列「不建議操作」的標的與各一句原因。
+最後以一行總結今日最重要的風險（如財報、VIX、板塊相關性過高）。
+"""
+
+
+def run_portfolio_summary(context_text: str, n: int, period_label: str):
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
+        if not api_key:
+            return None, "❌ 找不到 GROQ_API_KEY，請在 Secrets 設定。"
+        client = Groq(api_key=api_key)
+    except Exception as e:
+        return None, f"❌ Groq 初始化失敗：{e}"
+
+    user_prompt = (
+        f"以下是 {n} 支股票的完整資料（技術面數據為近 3 個月日線快速掃描）。"
+        f"分析日期：{datetime.now().strftime('%Y-%m-%d')}。\n\n"
+        f"{context_text}\n\n請嚴格依照格式輸出四個段落。"
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": PORTFOLIO_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=3500,
+        )
+        return resp.choices[0].message.content.strip(), None
+    except Exception as e:
+        msg = str(e)
+        if "rate_limit" in msg.lower() or "429" in msg:
+            return None, "⏳ Groq 速率／額度限制，請稍後再按「重新生成」，或減少股票數量。"
+        return None, f"❌ Groq API 錯誤：{e}"
+
+
+def render_ai_summary(box, valid, period_key: str, auto: bool):
+    """在 box 容器內顯示 AI 深度總結；相同股票組合只自動生成一次。"""
+    if not valid:
+        return
+    targets = valid[:10]  # 已按 偏多 > 中性 > 偏空 排序；最多送 10 支，控制 token
+    tickers = [t for t, _ in targets]
+    sig = (tuple(sorted(tickers)), period_key)
+    state = st.session_state.get('_ai_summary')
+
+    with box:
+        st.markdown('<div class="section-header">🧠 AI 深度總結（基本面 × 財報 × 新聞 × 技術面）</div>',
+                    unsafe_allow_html=True)
+        c1, c2 = st.columns([1, 4])
+        with c1:
+            regen = st.button("🔄 重新生成", key="ai_regen")
+        with c2:
+            if len(valid) > 10:
+                st.caption(f"⚠️ 為控制 token，僅分析信號排序前 10 支（共 {len(valid)} 支）")
+
+        need = regen or (auto and (not state or state.get('sig') != sig))
+        if not need and not state:
+            if st.button("🧠 生成 AI 深度總結", key="ai_gen_first", type="primary"):
+                need = True
+
+        if need:
+            with st.spinner("抓取基本面／財報／新聞並進行 AI 整合分析（約 20–40 秒）..."):
+                ctx_cache = st.session_state.setdefault('_ctx_cache', {})
+                now = time.time()
+                todo = [(t, d['name']) for t, d in targets
+                        if t not in ctx_cache or now - ctx_cache[t]['ts'] > 1800 or regen]
+                if todo:
+                    with ThreadPoolExecutor(max_workers=min(len(todo), 5)) as ex:
+                        fut = {ex.submit(_gather_context, t, nm): t for t, nm in todo}
+                        for f in as_completed(fut):
+                            t = fut[f]
+                            try:
+                                ctx_cache[t] = {"ts": now, "data": f.result(timeout=60)}
+                            except Exception:
+                                ctx_cache[t] = {"ts": now, "data": {}}
+                ctx_map = {t: ctx_cache.get(t, {}).get("data", {}) for t in tickers}
+                single_cache = st.session_state.get('analysis_cache', {})
+                ctx_text = build_context_text(targets, ctx_map, single_cache, period_key)
+                text, err = run_portfolio_summary(ctx_text, len(targets), PERIOD_MAP[period_key]["label"])
+            state = {"sig": sig, "text": text, "err": err,
+                     "ts": datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            st.session_state['_ai_summary'] = state
+
+        if state:
+            if state.get('err'):
+                st.error(state['err'])
+            else:
+                st.markdown(state['text'])
+                st.caption(f"⏱️ 生成於 {state['ts']} · 基本面來自 yfinance（可能延遲或缺漏）· "
+                           f"新聞僅含標題 · RR 為機械式估算，非交易建議")
+                st.download_button("⬇️ 下載總結 (.md)", state['text'],
+                                   file_name=f"ai_summary_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
+                                   mime="text/markdown", key="ai_dl")
+
+
+# ─────────────────────────────────────────────
 # 多股票 Dashboard 渲染
 # ─────────────────────────────────────────────
-def render_multi_dashboard(tickers: list, period_key: str):
+def render_multi_dashboard(tickers: list, period_key: str, auto_ai: bool = True):
     st.markdown('<div class="section-header">📊 多股票快速掃描 Dashboard</div>', unsafe_allow_html=True)
 
     if not tickers:
@@ -1029,6 +1327,9 @@ def render_multi_dashboard(tickers: list, period_key: str):
     if table_rows:
         df_table = pd.DataFrame(table_rows)
         st.dataframe(df_table, use_container_width=True, hide_index=True)
+
+    # AI 總結預留位置：卡片先顯示，總結完成後填入此容器（顯示在表格下方）
+    ai_box = st.container()
 
     # ── 卡片視圖 ──
     st.markdown("#### 🃏 卡片視圖")
@@ -1113,6 +1414,10 @@ def render_multi_dashboard(tickers: list, period_key: str):
                 st.plotly_chart(heatmap_fig, use_container_width=True)
         except:
             pass
+
+
+    # ── AI 深度總結 ──
+    render_ai_summary(ai_box, valid, period_key, auto_ai)
 
 
 # ─────────────────────────────────────────────
@@ -1234,6 +1539,11 @@ def render_single_analysis(ticker: str, period_key: str):
         </div>
         """, unsafe_allow_html=True)
 
+    st.session_state.setdefault('analysis_cache', {})[ticker] = {
+        "period": PERIOD_MAP[period_key]["label"], "bias": bias,
+        "strength": analysis.get("bias_strength", 5), "summary": analysis.get("summary", ""),
+        "news_sentiment": analysis.get("news_sentiment", "neut"),
+    }
     save_prediction(ticker, period_key, curr_price, bias, analysis.get("key_levels", {}))
     st.markdown("---")
     st.caption(f"⏱️ 分析完成 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · LLaMA-3.3-70B via Groq · RSI/ATR 使用 Wilder Smoothing")
@@ -1283,6 +1593,8 @@ def main():
         st.caption(f"已選 {len(multi_tickers)} 支股票：{', '.join(multi_tickers[:8])}{'...' if len(multi_tickers)>8 else ''}")
 
         scan_btn = st.button("🚀 啟動多股票掃描", type="primary", use_container_width=True)
+        auto_ai = st.checkbox("🧠 掃描後自動生成 AI 深度總結", value=True,
+                              help="自動抓基本面／財報／新聞，整合技術面給出優先順序；每次約消耗 1 次 Groq 請求")
 
         st.markdown("---")
         st.markdown("### 🔍 單股票深入分析")
@@ -1341,7 +1653,8 @@ def main():
                 st.session_state['_multi_period']  = period_key
             render_multi_dashboard(
                 st.session_state.get('_multi_tickers', multi_tickers),
-                st.session_state.get('_multi_period', period_key)
+                st.session_state.get('_multi_period', period_key),
+                auto_ai
             )
         else:
             st.info("👆 在左側選擇股票組合，點擊「啟動多股票掃描」開始")
@@ -1351,6 +1664,7 @@ def main():
             - 📋 彙總覽表：現價、漲跌、RSI、MACD、量比、信號分
             - 🃏 卡片視圖：含迷你走勢圖
             - 🔗 相關性熱力圖
+            - 🧠 AI 深度總結：基本面／財報／新聞 vs 技術面、RR 比較、操作優先順序
             - 🔍 一鍵跳轉單股票深入分析
             """)
 
