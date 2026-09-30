@@ -458,12 +458,53 @@ def compute_indicators(df):
     return ind
 
 
+def get_groq_key():
+    """依序嘗試 st.secrets（各種寫法）與環境變數；回傳 (key, 來源說明)。"""
+    key, src = "", "未找到"
+    try:
+        if "GROQ_API_KEY" in st.secrets:
+            key, src = st.secrets["GROQ_API_KEY"], "st.secrets"
+        else:
+            # 相容寫在 [section] 底下的情況
+            for sec in st.secrets:
+                try:
+                    if "GROQ_API_KEY" in st.secrets[sec]:
+                        key, src = st.secrets[sec]["GROQ_API_KEY"], f"st.secrets[{sec}]"
+                        break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    if not key:
+        key = os.environ.get("GROQ_API_KEY", "")
+        if key:
+            src = "環境變數"
+    key = str(key).strip().strip('"').strip("'")
+    return key, src
+
+
+def test_groq_connection():
+    key, src = get_groq_key()
+    if not key:
+        return False, "找不到 GROQ_API_KEY（st.secrets 與環境變數都沒有）。"
+    try:
+        client = Groq(api_key=key)
+        r = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": "回覆 OK"}],
+            max_tokens=5,
+        )
+        return True, f"✅ 連線成功（Key 來源：{src}，前綴 {key[:4]}…，長度 {len(key)}）"
+    except Exception as e:
+        return False, f"❌ Key 來源：{src}，前綴 {key[:4]}…，長度 {len(key)}\n錯誤：{type(e).__name__}: {e}"
+
+
 # ─── Groq 分析（修正版）───
 def run_groq_analysis(ticker, period_key, df, macro, ind, news):
     try:
-        api_key = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
+        api_key, _src = get_groq_key()
         if not api_key:
-            return None, "❌ 找不到 GROQ_API_KEY，請在 Secrets 設定。"
+            return None, "❌ 找不到 GROQ_API_KEY，請在 Secrets 設定（可用側邊欄「測試 Groq 連線」診斷）。"
         client = Groq(api_key=api_key)
     except Exception as e:
         return None, f"❌ Groq 初始化失敗：{e}"
@@ -1175,9 +1216,9 @@ PORTFOLIO_SYSTEM_PROMPT = """你是一位資深美股交易分析師，任務是
 
 def run_portfolio_summary(context_text: str, n: int, period_label: str):
     try:
-        api_key = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
+        api_key, _src = get_groq_key()
         if not api_key:
-            return None, "❌ 找不到 GROQ_API_KEY，請在 Secrets 設定。"
+            return None, "❌ 找不到 GROQ_API_KEY，請在 Secrets 設定（可用側邊欄「測試 Groq 連線」診斷）。"
         client = Groq(api_key=api_key)
     except Exception as e:
         return None, f"❌ Groq 初始化失敗：{e}"
@@ -1595,6 +1636,10 @@ def main():
         scan_btn = st.button("🚀 啟動多股票掃描", type="primary", use_container_width=True)
         auto_ai = st.checkbox("🧠 掃描後自動生成 AI 深度總結", value=True,
                               help="自動抓基本面／財報／新聞，整合技術面給出優先順序；每次約消耗 1 次 Groq 請求")
+
+        if st.button("🔌 測試 Groq 連線", use_container_width=True):
+            ok, msg = test_groq_connection()
+            (st.success if ok else st.error)(msg)
 
         st.markdown("---")
         st.markdown("### 🔍 單股票深入分析")
