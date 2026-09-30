@@ -458,43 +458,121 @@ def compute_indicators(df):
     return ind
 
 
+def _visible_secret_names():
+    """回傳程式實際看得到的 secrets 名稱（不含內容）。"""
+    names = []
+    try:
+        for k in st.secrets:
+            names.append(str(k))
+            try:
+                sub = st.secrets[k]
+                if hasattr(sub, "keys"):
+                    names += [f"{k}.{x}" for x in sub.keys()]
+            except Exception:
+                pass
+    except Exception as e:
+        return [f"(無法讀取 st.secrets：{type(e).__name__})"]
+    return names
+
+
 def get_groq_key():
-    """依序嘗試 st.secrets（各種寫法）與環境變數；回傳 (key, 來源說明)。"""
+    """依序嘗試 st.secrets（名稱大小寫不拘、含 groq 即可、可在 [section] 內）與環境變數。"""
     key, src = "", "未找到"
     try:
-        if "GROQ_API_KEY" in st.secrets:
-            key, src = st.secrets["GROQ_API_KEY"], "st.secrets"
-        else:
-            # 相容寫在 [section] 底下的情況
-            for sec in st.secrets:
-                try:
-                    if "GROQ_API_KEY" in st.secrets[sec]:
-                        key, src = st.secrets[sec]["GROQ_API_KEY"], f"st.secrets[{sec}]"
+        for k in st.secrets:
+            v = st.secrets[k]
+            if hasattr(v, "keys"):
+                for kk in v.keys():
+                    if "groq" in str(kk).lower():
+                        key, src = v[kk], f"st.secrets[{k}][{kk}]"
                         break
-                except Exception:
-                    pass
+            elif "groq" in str(k).lower():
+                key, src = v, f"st.secrets[{k}]"
+            if key:
+                break
     except Exception:
         pass
     if not key:
-        key = os.environ.get("GROQ_API_KEY", "")
-        if key:
-            src = "環境變數"
+        for ek, ev in os.environ.items():
+            if "groq" in ek.lower() and ev:
+                key, src = ev, f"環境變數 {ek}"
+                break
     key = str(key).strip().strip('"').strip("'")
     return key, src
+
+
+GROQ_MODEL_PREF = [
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "qwen/qwen3.8-27b",
+    "qwen/qwen3.6-27b",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+]
+_GROQ_NON_CHAT = ("whisper", "tts", "guard", "safeguard", "compound", "orpheus", "embed")
+
+
+def _groq_model_candidates(client):
+    """向 Groq 查詢此帳號實際可用的模型，依偏好排序。可用 GROQ_MODEL 強制指定。"""
+    override = os.environ.get("GROQ_MODEL", "")
+    try:
+        override = override or st.secrets.get("GROQ_MODEL", "")
+    except Exception:
+        pass
+    try:
+        ids = [m.id for m in client.models.list().data]
+    except Exception:
+        ids = []
+    chat_ids = [i for i in ids if not any(b in i.lower() for b in _GROQ_NON_CHAT)]
+    cands = [override] if override else []
+    cands += [m for m in GROQ_MODEL_PREF if (not ids or m in ids) and m not in cands]
+    cands += [i for i in chat_ids if i not in cands]
+    return cands or list(GROQ_MODEL_PREF)
+
+
+def groq_chat(client, messages, temperature=0.3, max_tokens=3000):
+    """自動選模型；遇到 model_not_found 換下一個；移除推理模型的 <think> 區塊。"""
+    cached = st.session_state.get('_groq_model')
+    cands = [cached] if cached else _groq_model_candidates(client)
+    last = None
+    for round_ in (0, 1):
+        for m in cands[:6]:
+            try:
+                r = client.chat.completions.create(
+                    model=m, messages=messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                )
+                txt = r.choices[0].message.content or ""
+                txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL).strip()
+                if not txt:
+                    raise RuntimeError(f"模型 {m} 回傳空內容（可能推理用盡 token）")
+                st.session_state['_groq_model'] = m
+                return txt
+            except Exception as e:
+                last = e
+                low = str(e).lower()
+                if any(x in low for x in ("model_not_found", "does not exist", "decommission", "404", "空內容")):
+                    st.session_state.pop('_groq_model', None)
+                    continue
+                raise
+        if round_ == 0 and cached:
+            cands = _groq_model_candidates(client)
+        else:
+            break
+    raise last if last else RuntimeError("沒有可用的 Groq 模型")
 
 
 def test_groq_connection():
     key, src = get_groq_key()
     if not key:
-        return False, "找不到 GROQ_API_KEY（st.secrets 與環境變數都沒有）。"
+        names = _visible_secret_names()
+        return False, ("找不到 GROQ_API_KEY（st.secrets 與環境變數都沒有）。\n"
+                       f"程式目前看得到的 secrets 名稱：{', '.join(names) if names else '（空，完全沒有讀到任何 secrets）'}")
     try:
         client = Groq(api_key=key)
-        r = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": "回覆 OK"}],
-            max_tokens=5,
-        )
-        return True, f"✅ 連線成功（Key 來源：{src}，前綴 {key[:4]}…，長度 {len(key)}）"
+        groq_chat(client, [{"role": "user", "content": "回覆 OK"}], 0.0, 300)
+        return True, (f"✅ 連線成功（Key 來源：{src}，前綴 {key[:4]}…，長度 {len(key)}）\n"
+                      f"使用模型：{st.session_state.get('_groq_model')}")
     except Exception as e:
         return False, f"❌ Key 來源：{src}，前綴 {key[:4]}…，長度 {len(key)}\n錯誤：{type(e).__name__}: {e}"
 
@@ -670,16 +748,10 @@ ATR(14/Wilder) = {atr_val:.2f}
 """
 
     try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt}
-            ],
-            temperature=0.3,
-            max_tokens=3000,
-        )
-        raw = response.choices[0].message.content.strip()
+        raw = groq_chat(client, [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ], 0.3, 4500).strip()
         # 清理 markdown fences
         raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
         raw = re.sub(r'\s*```\s*$', '', raw, flags=re.MULTILINE)
@@ -1229,16 +1301,11 @@ def run_portfolio_summary(context_text: str, n: int, period_label: str):
         f"{context_text}\n\n請嚴格依照格式輸出四個段落。"
     )
     try:
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": PORTFOLIO_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-            max_tokens=3500,
-        )
-        return resp.choices[0].message.content.strip(), None
+        text = groq_chat(client, [
+            {"role": "system", "content": PORTFOLIO_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ], 0.2, 5000)
+        return text.strip(), None
     except Exception as e:
         msg = str(e)
         if "rate_limit" in msg.lower() or "429" in msg:
@@ -1587,7 +1654,7 @@ def render_single_analysis(ticker: str, period_key: str):
     }
     save_prediction(ticker, period_key, curr_price, bias, analysis.get("key_levels", {}))
     st.markdown("---")
-    st.caption(f"⏱️ 分析完成 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · LLaMA-3.3-70B via Groq · RSI/ATR 使用 Wilder Smoothing")
+    st.caption(f"⏱️ 分析完成 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · {st.session_state.get('_groq_model', 'Groq')} via Groq · RSI/ATR 使用 Wilder Smoothing")
 
 
 # ─────────────────────────────────────────────
@@ -1595,7 +1662,7 @@ def render_single_analysis(ticker: str, period_key: str):
 # ─────────────────────────────────────────────
 def main():
     st.markdown('<div class="main-title">📈 多股票智能分析系統</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">Groq LLaMA-3.3-70B · 技術面 + 宏觀 + 情緒 · 多股票並發掃描 · 入場/止損/止盈</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Groq AI · 技術面 + 宏觀 + 情緒 · 多股票並發掃描 · 入場/止損/止盈</div>', unsafe_allow_html=True)
 
     # Session state 初始化
     if 'active_tab' not in st.session_state:
